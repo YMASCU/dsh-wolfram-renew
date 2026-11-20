@@ -1,14 +1,18 @@
 {
-  "name": "dsh-wolfram",
-  "version": "0.1.0",
-  "description": "Call Wolfram Mathematica from DeepSeek Harness",
+  "name": "dsh-wolfram-renew",
+  "version": "0.2.0",
+  "description": "Call Wolfram Mathematica / Wolfram Engine from DeepSeek Harness",
   "type": "module",
   "main": "index.js",
-  "files": ["index.js", "cordis.patch.yml"],
-  "keywords": ["dsh", "dsh-plugin", "mathematica", "wolfram"],
+  "files": ["index.js", "wolfram.js", "cordis.patch.yml", "README.md", "README.zh.md", "LICENSE"],
+  "scripts": {
+    "check": "node --check index.js && node --check wolfram.js"
+  },
+  "keywords": ["dsh", "dsh-plugin", "mathematica", "wolfram", "wolfram-engine", "cas"],
+  "engines": { "node": ">=18.17.0" },
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.2.0-0"
+    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1"
   },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" }
