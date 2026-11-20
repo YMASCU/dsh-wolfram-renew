@@ -2,7 +2,7 @@
 
 **English** | [简体中文](README.zh.md)
 
-This plugin is derived from [dsh-wolfram](https://github.com/hatter123/dsh-wolfram) and reimplemented against the plugin machinery of the current [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (0.2.2 line). It provides a bilingual configuration page, optional sandboxed execution, a selectable execution front-end, and complete error and timeout handling.
+[This plugin](https://github.com/YMASCU/dsh-wolfram-renew) is derived from [dsh-wolfram](https://github.com/hatter123/dsh-wolfram) and reimplemented against the plugin machinery of the current [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (0.2.2 line). It provides a bilingual configuration page, optional sandboxed execution, a selectable execution front-end, and complete error and timeout handling.
 
 The plugin calls [Wolfram Mathematica](https://www.wolfram.com/mathematica/) or the free [Wolfram Engine](https://www.wolfram.com/engine/) from DeepSeek Harness and registers a tool named `wolfram` (Loader row `wolfram-tool`) that evaluates Wolfram Language code through the `math` binary of the installation (or `wolframscript` when the sandbox is disabled) and returns the result as `InputForm` text.
 
@@ -67,6 +67,26 @@ Mathematica does not report errors through its exit code: a syntax error exits w
 
 - By default every evaluation is wrapped by the DSH sandbox under the file policy of the current session: a `workspace-write` session may write only the workspace and its private temporary directory, a `read-only` session may not write at all, and only a `danger-full-access` session is unrestricted. Disabling **Use the sandbox** removes the wrapping. When the sandbox remains enabled but no sandbox backend is mounted, the plugin refuses to execute rather than running unconstrained.
 - A kernel that exceeds `timeout` is not terminated; it is handed over to a background job. The result reports the job id, which can be read with `job_output` and stopped with `job_kill`. Only when no job registry is available does the plugin fall back to terminating on timeout.
+
+## Comparison with the official Wolfram MCP
+
+Wolfram Research publishes an official MCP service (<https://www.wolfram.com/ai/mcp>) in two forms, local and cloud. The local form is distributed as the [AgentTools paclet](https://resources.wolframcloud.com/PacletRepository/resources/Wolfram/AgentTools/) and is deployed into a supported MCP client by `InstallMCPServer`. Both that service and this plugin give an agent access to Wolfram Language evaluation, but they differ in design goal and technical route, and therefore in the situations to which they are suited. The two are not mutually exclusive: DSH can also reach the official service through its MCP connection, in which case both capabilities are available and may be selected according to the nature of the task.
+
+| Dimension | Official Wolfram MCP | This plugin |
+| --- | --- | --- |
+| Scope | A set of tools — `WolframContext`, `WolframLanguageEvaluator` and `WolframAlpha` — covering natural-language questioning, knowledge retrieval and code evaluation, in local and cloud form. | A single `wolfram` tool whose only responsibility is code evaluation; the result is returned as `InputForm` text. |
+| Granularity and context cost | Several tools with longer descriptions, so tool selection and context cost are greater. | One tool with two parameters; a fixed shape, low context cost and predictable behavior. |
+| Wolfram version requirement | The local form requires Wolfram Engine or Mathematica 15.0 or later, and full functionality additionally requires an LLM Kit subscription. | Only a `math` or `wolframscript` front-end in the installation directory is required; no paclet is involved, so the version threshold is lower. |
+| Deployment | The paclet is installed, `InstallMCPServer` writes the client configuration, and the client is restarted; the cloud form additionally requires an account and service authorization. | One `dsh plugin add`; settings are made on the configuration page and take effect on save; removal leaves nothing behind. |
+| Session state | A resident kernel retains definitions and context across calls, which favors multi-step derivations but may also carry state over. | A fresh kernel per call; evaluations are isolated and reproducible, but expressions must be self-contained and each call pays a start-up cost of about 1.5 s warm and 2.5–3 s cold. |
+| Output form | Follows the MCP content model and can carry content types other than text. | Uniformly `InputForm` text; graphics, images and notebook objects degrade to text and are not rendered directly. |
+| DSH integration | Addressed to generic MCP clients and not adapted to DSH specifically. | Registered as a native DSH tool: sandboxed under the session's file policy, handed over to a background job on timeout, described in a system-prompt section, and configured through a bilingual page. |
+| Sandbox and long-running work | A resident process fixes its privileges at start-up, so they cannot follow the DSH session's file policy call by call; a call that exceeds the client's deadline has no channel to a DSH job. | See "Sandbox and background jobs" above: confinement per call, and hand-off to `job_output` and `job_kill` on timeout. |
+| Network and data | The cloud form submits queries and code to Wolfram Cloud; the local form also exchanges data with Wolfram services for authorization and component updates. | Apart from Wolfram product license checks, evaluation is entirely local; expressions do not leave the machine. |
+| Error semantics | Reports results and errors as the MCP protocol prescribes; diagnostic granularity is determined by the server. | Treats `$Failed`, a non-zero exit and empty output as failures, and distinguishes a sandbox runner failure from a refused file access. |
+| License and maintenance | Maintained by Wolfram Research; features arrive with paclet updates, and customization is bounded by its interfaces. | MIT; a small code base that can be audited and modified as needed, tracking the DSH plugin interface. |
+
+The choice may be summarized as follows. Where a task involves natural-language questioning, knowledge retrieval, rich output or the retention of state across a multi-step derivation, the official MCP is the more suitable instrument. Where the task is confined to computation expressed as code, and installation economy, a lower Wolfram version requirement, sandbox confinement and long-task management are valued, this plugin is the more suitable. The scope of this plugin is deliberately narrow: it does not seek to replace the official service, but to provide, within the DSH tool model, an evaluation channel with clear boundaries and predictable behavior.
 
 ## Notes
 
