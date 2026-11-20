@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Wolfram">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#3b5bdb"/>
+  <path d="M41 15c-7 0-11 4.6-11 11.6v4.2c0 5.4-2.1 8.1-7 8.4v3.6c4.9.3 7 3 7 8.4v.9c0 1.9.5 3.3 1.6 4.3" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="45.5" cy="41.5" r="5.5" fill="#ffffff"/>
+  <circle cx="45.5" cy="22.5" r="3" fill="#c9d6ff"/>
+</svg>

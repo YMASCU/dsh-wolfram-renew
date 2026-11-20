@@ -132,19 +132,31 @@ export function discoverInstallations() {
   return [...found].sort(compareVersionsDesc)
 }
 
-/** The ordered candidates one evaluation may try. */
-function candidateExecutables(explicit) {
+/** One install directory from either a directory or an executable path. */
+function installDirOf(value) {
+  const trimmed = String(value ?? '').trim()
+  if (trimmed === '') return undefined
+  const resolved = path.resolve(trimmed)
+  return /\.(exe|com)$/i.test(resolved) ? path.dirname(resolved) : resolved
+}
+
+/**
+ * The ordered install directories one evaluation may try.
+ *
+ * A directory is the unit of configuration: the executable inside it is chosen
+ * per call from `frontend`, so an install that ships only `math.exe` still works.
+ */
+function candidateDirectories(explicit) {
   const candidates = []
-  const push = (exe, source, extra = {}) => {
-    if (!exe || candidates.some((candidate) => candidate.exe === exe)) return
-    candidates.push({ exe, source, ...extra })
+  const push = (dir, source) => {
+    if (dir === undefined || candidates.some((candidate) => candidate.dir === dir)) return
+    candidates.push({ dir, source })
   }
-  push(explicit?.trim(), 'config executable')
-  push(process.env.DSH_WOLFRAMSCRIPT?.trim(), 'DSH_WOLFRAMSCRIPT')
-  // Marked `bare`: a confined runner needs an absolute image path, because the
-  // restricted token it creates does not search PATH.
-  push(SCRIPT_NAME, 'PATH', { bare: true })
-  for (const exe of discoverInstallations()) push(exe, 'discovered')
+  push(installDirOf(explicit), 'config directory')
+  push(installDirOf(process.env.DSH_WOLFRAMSCRIPT), 'DSH_WOLFRAMSCRIPT')
+  const onPath = resolveOnPath(SCRIPT_NAME) ?? resolveOnPath(FRONT_END_NAME)
+  if (onPath !== undefined) push(path.dirname(onPath), 'PATH')
+  for (const exe of discoverInstallations()) push(path.dirname(exe), 'discovered')
   return candidates
 }
 
@@ -183,15 +195,28 @@ function runProgram(source) {
 }
 
 /**
- * The argv for one install: the console front-end when it is there, else
- * `wolframscript -code` (which needs an unconfined user config).
+ * The argv for one install directory, or undefined when it holds no executable.
+ *
+ * `frontend` is `math`, `wolframscript`, or unset:
+ *   - `wolframscript` runs `-code` and needs an unconfined user config, so the
+ *     Host only asks for it when no sandbox wraps the process;
+ *   - `math` (and the unset default) uses the console front-end when the
+ *     install ships one, which is the only mode that works under a restricted
+ *     token, and falls back to `-code` when it does not.
  */
-function invocationFor(image, source) {
-  const frontEnd = path.join(path.dirname(image), FRONT_END_NAME)
-  if (existsSync(frontEnd)) {
-    return { image: frontEnd, argv: [frontEnd, '-noprompt', '-run', runProgram(source)] }
+function invocationFor(dir, source, frontend) {
+  const scriptPath = path.join(dir, SCRIPT_NAME)
+  const mathPath = path.join(dir, FRONT_END_NAME)
+  const hasScript = existsSync(scriptPath)
+  const hasMath = existsSync(mathPath)
+  if (!hasScript && !hasMath) return undefined
+  if (frontend === 'wolframscript' && hasScript) {
+    return { image: scriptPath, argv: [scriptPath, '-code', source] }
   }
-  return { image, argv: [image, '-code', source] }
+  if (hasMath) {
+    return { image: mathPath, argv: [mathPath, '-noprompt', '-run', runProgram(source)] }
+  }
+  return { image: scriptPath, argv: [scriptPath, '-code', source] }
 }
 
 /**
@@ -413,7 +438,8 @@ function promotedText(jobId, timeoutMs, handle) {
  * {@link WolframError}.
  *
  * @param {string} expression - Wolfram Language source.
- * @param {{ executable?: string, timeoutMs?: number, jobs?: object, exec?: object,
+ * @param {{ directory?: string, timeoutMs?: number, frontend?: 'math'|'wolframscript',
+ *   jobs?: object, exec?: object,
  *   confine?: (argv: string[]) => Promise<{ argv: string[], mode?: string }>,
  *   cwd?: string, env?: object }} [options]
  */
@@ -441,15 +467,12 @@ export async function runWolfram(expression, options = {}) {
   let missing = false
   let runnerRules = []
   let denialSignatures = []
-  for (const candidate of candidateExecutables(options.executable)) {
-    // A confined runner needs an absolute image path; a bare name would reach it
-    // as `wolframscript.exe` and fail CreateProcessAsUserW with Win32 2.
-    const image = candidate.bare ? resolveOnPath(SCRIPT_NAME) : candidate.exe
-    if (image === undefined) {
+  for (const candidate of candidateDirectories(options.directory)) {
+    const invocation = invocationFor(candidate.dir, source, options.frontend)
+    if (invocation === undefined) {
       missing = true
       continue
     }
-    const invocation = invocationFor(image, source)
     let argv = invocation.argv
     if (options.confine !== undefined) {
       const confined = await options.confine(argv)
@@ -470,7 +493,7 @@ export async function runWolfram(expression, options = {}) {
       continue
     }
     throw new WolframError(
-      `could not start ${image}: ${started.error?.message ?? String(started.error)}`,
+      `could not start ${invocation.image}: ${started.error?.message ?? String(started.error)}`,
       'spawn',
     )
   }
@@ -479,7 +502,7 @@ export async function runWolfram(expression, options = {}) {
     throw new WolframError(
       missing
         ? 'no `wolframscript` found on PATH and no Wolfram Engine/Mathematica install under '
-          + 'Program Files\\Wolfram Research. Install the Wolfram Engine, or set `executable` in this '
+          + 'Program Files\\Wolfram Research. Install the Wolfram Engine, or set `installDir` in this '
           + "plugin's config / the DSH_WOLFRAMSCRIPT environment variable."
         : 'no usable `wolframscript` candidate was found',
       'missing',

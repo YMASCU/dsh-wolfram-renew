@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-wolfram-renew",
+    "description": "注册 `wolfram` 工具（Loader 行 `wolfram-tool`）：通过本机安装的 Wolfram Engine 或 Mathematica 执行精确的符号与数值计算。默认在会话沙箱内执行；沙箱可在插件页关闭（Android 等无法启动受控进程的环境需关闭），关闭后方可选 `math` 或 `wolframscript` 作为执行前端。超出超时的求值将转入后台任务继续运行。禁用本插件即移除该工具。"
+  }
+}

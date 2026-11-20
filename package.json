@@ -1,20 +1,64 @@
 {
   "name": "dsh-wolfram-renew",
-  "version": "0.2.0",
-  "description": "Call Wolfram Mathematica / Wolfram Engine from DeepSeek Harness",
+  "version": "0.3.0",
+  "description": "Wolfram Engine / Mathematica for DeepSeek Harness: a sandboxed wolfram tool with a bilingual settings page",
   "type": "module",
   "main": "index.js",
-  "files": ["index.js", "wolfram.js", "cordis.patch.yml", "README.md", "README.zh.md", "LICENSE"],
+  "files": [
+    "index.js",
+    "wolfram.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "check": "node --check index.js && node --check wolfram.js"
+    "check": "node --check index.js && node --check wolfram.js && node --check client.js && node scripts/check-contracts.mjs"
   },
-  "keywords": ["dsh", "dsh-plugin", "mathematica", "wolfram", "wolfram-engine", "cas"],
-  "engines": { "node": ">=18.17.0" },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "mathematica",
+    "wolfram",
+    "wolfram-engine",
+    "cas"
+  ],
+  "engines": {
+    "node": ">=18.17.0",
+    "dsh": ">=0.2.2-rc.1"
+  },
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/dsh-tools": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1"
+    "@deepseek-ai/dsh-tools": ">=0.2.2-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.2 || >=3.18.6-alpha.2 <4.0.0"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" }
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-plugin-manager",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.2-rc.1+": "compatible"
+      }
+    }
+  },
+  "icon": "icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
   }
 }

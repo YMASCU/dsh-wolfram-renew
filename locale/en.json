@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-wolfram-renew",
+    "description": "Registers the `wolfram` tool (Loader row `wolfram-tool`): exact symbolic and numeric Wolfram Language evaluation through the local Wolfram Engine or Mathematica installation. Evaluations run inside the session sandbox by default; the sandbox can be disabled on the plugin page (required where the sandbox runner cannot start processes, such as Android), after which `math` or `wolframscript` may be selected as the front-end. An evaluation that exceeds its timeout continues as a background job. Disabling the plugin removes the tool."
+  }
+}
