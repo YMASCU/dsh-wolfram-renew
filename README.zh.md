@@ -4,7 +4,7 @@
 
 [本插件](https://github.com/YMASCU/dsh-wolfram-renew)派生自 [dsh-wolfram](https://github.com/hatter123/dsh-wolfram)，并依据当前 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（0.2.2 系列）的插件机制重新实现，提供中英双语的配置页面、可选的沙箱执行、可切换的执行前端，以及完整的错误处理与超时机制。
 
-插件通过 DeepSeek Harness 调用 [Wolfram Mathematica](https://www.wolfram.com/mathematica/) 或免费的 [Wolfram Engine](https://www.wolfram.com/engine/)，注册名为 `wolfram` 的工具（对应 Loader 行 `wolfram-tool`）：该工具以安装目录中的 `math`（或在关闭沙箱时选用 `wolframscript`）执行 Wolfram Language 代码，并返回结果的 `InputForm` 文本。
+插件通过 DeepSeek Harness 调用 [Wolfram Mathematica](https://www.wolfram.com/mathematica/) 或免费的 [Wolfram Engine](https://www.wolfram.com/engine/)，注册名为 `wolfram` 的工具（对应 Loader 行 `wolfram-tool`）：该工具以安装目录中的 `math`（或在关闭沙箱时选用 `wolframscript`）执行 Wolfram Language 代码，将普通结果以 `InputForm` 文本返回，将图形结果导出为图像文件，并把过长的输出保留尾部、完整文本另存为转储文件。
 
 ## 前置要求
 
@@ -21,6 +21,27 @@ dsh plugin --profile <profile> add github:YMASCU/dsh-wolfram-renew
 原始 [dsh-wolfram](https://github.com/hatter123/dsh-wolfram) 将求值时限固定，本插件将其改为可选参数，由 agent 按需指定。
 
 agent 调用 `wolfram` 工具，入参为 `expression`（Wolfram Language 代码）与可选的 `timeout`（秒）。
+
+## 面向 agent 的提示词
+
+工具的系统提示段落（`tool:wolfram`）只陈述三项内容：工具用途、普通结果以 `InputForm` 返回、`;` 分隔的复合表达式仅取最后一个值（结尾的 `;` 返回 `Null`）。
+
+其余信息均由工具输出在实际发生时承载：Mathematica 失败以失败结果返回，其正文包含内核消息；超出时限的求值在结果中给出继续运行的后台作业；图形结果以 `[graphics]` 块返回；被截断的流以 `[output truncated; full output: <路径>]` 结尾。上述形态因此不写入提示词，`scripts/check-contracts.mjs` 断言 `index.js` 不包含这些描述。
+
+## 结果呈现
+
+以下两项行为对齐 DSH 自带 shell 工具，使结果保持在会话可以承受的规模之内，并让图形结果仍然可用：
+
+- **输出截断**：每条流仅保留最后 64,000 字节，与 `pwsh` 工具一致；更长的部分写入操作系统临时目录下的完整输出转储文件，文本末尾给出 `[output truncated; full output: <路径>]`；若连转储上限也被突破，则标记为 `(unavailable)`。后台作业的读取同样受限。
+- **图形落盘**：当结果的头部为 `Image`、`Image3D`、`Graphics`、`Graphics3D`、`GraphicsComplex`、`Legended`、`Manipulate`、`Animate`（其求值结果为 `Manipulate`）/ `ListAnimate`、`GraphicsRow`/`GraphicsGrid`/`GraphicsColumn` 或 `GeoGraphics` 时，不再打印文本，而是导出为文件：静态图像与图形导出为 PNG，动画导出为 GIF。文件写入平台临时目录（`$TemporaryDirectory`；在沙箱下由 DSH 指向会话的私有临时目录）中的 `dsh-wolfram/wl-<pid>-<时间>/`，结果中给出路径：
+
+  ```
+  [graphics] head: Graphics
+  [graphics] file: C:\Users\...\Temp\dsh-xxxx\dsh-wolfram\wl-1234-1758\result.png
+  [graphics] format: PNG (480x360 px), 17110 bytes
+  ```
+
+  这些结果头部不会再输出 `InputForm`；若文件未能写出，结果会说明原因并区分两种情形：只读会话不允许任何写入，而缺少图形组件属于一次性的 Wolfram 下载，需要联网与可写的用户目录——该组件会永久安装在用户 paclet 仓库中，同一台机器只需付出一次，后续导出不再下载。首次安装时打印的进度行会原样返回：插件不会裁剪任何输出。
 
 ## 配置界面
 
@@ -74,12 +95,12 @@ Wolfram Research 亦提供官方 MCP 服务（<https://www.wolfram.com/ai/mcp>�
 
 | 维度 | 官方 Wolfram MCP | 本插件 |
 | --- | --- | --- |
-| 功能范围 | 提供 `WolframContext`、`WolframLanguageEvaluator`、`WolframAlpha` 等一组工具，覆盖自然语言提问、知识库检索与代码求值，兼有本地与云端两种形态。 | 仅注册 `wolfram` 一个工具，职责限于代码求值，结果以 `InputForm` 文本返回。 |
+| 功能范围 | 提供 `WolframContext`、`WolframLanguageEvaluator`、`WolframAlpha` 等一组工具，覆盖自然语言提问、知识库检索与代码求值，兼有本地与云端两种形态。 | 仅注册 `wolfram` 一个工具，职责限于代码求值；普通结果以 `InputForm` 文本返回。 |
 | 调用粒度与上下文开销 | 工具数量较多、描述较长，工具选择与上下文开销相应较大。 | 单一工具、两个参数，形态固定，上下文开销小，行为可预期。 |
 | Wolfram 版本要求 | 本地形态要求 Wolfram Engine 或 Mathematica 15.0 及以上；完整功能另需 LLM Kit 订阅。 | 仅要求安装目录内含 `math` 或 `wolframscript` 前端，不涉及 paclet 机制，版本门槛较低。 |
 | 部署方式 | 安装 paclet，执行 `InstallMCPServer` 写入客户端配置并重启客户端；云端形态另需账户与服务授权。 | 执行一次 `dsh plugin add`；设置于配置页内完成，保存即生效；卸载后不残留。 |
 | 会话状态 | 常驻内核，定义与上下文跨调用保留，利于多步推导，但亦可能引入状态残留。 | 每次调用启动独立内核，求值彼此隔离、结果可复现；表达式须自包含，单次启动开销约为热启动 1.5 s、冷启动 2.5–3 s。 |
-| 输出形态 | 遵循 MCP 内容模型，可承载文本以外的内容类型。 | 统一为 `InputForm` 文本；图形、图像与笔记本对象退化为文本，不作直接呈现。 |
+| 输出形态 | 遵循 MCP 内容模型，可承载文本以外的内容类型。 | 普通结果为 `InputForm` 文本；图形结果导出到临时目录中的 PNG/GIF 并给出路径；过长的输出保留尾部并另存完整文本的转储文件。 |
 | DSH 适配 | 面向通用 MCP 客户端，未针对 DSH 作专门适配。 | 注册为 DSH 原生工具：按会话文件策略施加沙箱，超时移交后台作业，注入系统提示段落，并提供双语配置页。 |
 | 沙箱与长任务 | 常驻进程的权限在启动时确定，无法随 DSH 会话的文件策略逐次调整；超过客户端时限的调用亦无移交 DSH 作业的通道。 | 即上文「沙箱与后台任务」：逐次包裹，超时移交 `job_output` 与 `job_kill`。 |
 | 网络与数据 | 云端形态将查询与代码提交至 Wolfram Cloud；本地形态亦需与 Wolfram 服务交互，以完成授权与组件更新。 | 除 Wolfram 产品的许可校验外，求值全程在本机完成，表达式不出本机。 |
@@ -93,6 +114,21 @@ Wolfram Research 亦提供官方 MCP 服务（<https://www.wolfram.com/ai/mcp>�
 - 每次调用均启动新的内核：在 Wolfram Engine 15.0 上热启动约 1.5 s，冷启动约 2.5–3 s。
 - 默认使用 `math` 的原因：受限令牌下，`wolframscript` 创建的 `*_shm` 链接无法连至内核对端，将报 `LinkConnect::linkc` 并挂起；`math` 采用内部前端路径，不受此限制。
 - `math.exe` 为 CONSOLE 子系统程序，spawn 时使用 `windowsHide`，不会弹出控制台窗口。
+- 受限会话无法安装 Wolfram 的图形组件，因此每次图形导出都可能在结果之前打印一条 `RegisterFormat::interr`
+  消息（每个内核还可能出现几行 `Connecting...`）。导出本身仍借助已安装的组件成功完成；插件不做裁剪，这些行会保留。
+
+## 已知限制
+
+旧版本Wolfram在受限会话中的图形导出存在已知问题，在Windows 11环境中观测到如下结果：
+
+| 安装 | `math.exe` | 沙箱开启时的图形导出 | 沙箱关闭时的图形导出 |
+| --- | --- | --- | --- |
+| Wolfram Engine 15.0 | 原生可执行文件 | 可完成，单次约 5 s | 可完成 |
+| Mathematica 13.2 | .NET 启动器 | 不可完成：内核可启动并求值，`Export` 既不返回也不写出文件，超过时限后调用移交后台作业 | 可完成（探针：PNG，15,494 字节） |
+
+受限模式下，DSH 沙箱的受限令牌禁止命名管道，而基于 .NET 的 `math.exe` 需要自身的 `\\.\pipe\LOCAL\dotnet_<guid>`。在受限 shell 中直接启动时进程完全不启动，拒绝表现为启动失败；由本插件经沙箱 runner 启动时进程可启动，且可进行数值与符号计算，但图形导出不能完成。两种症状是否同源，本文不作断言。
+
+目前仅实测 Mathematica 13.2。但其他版本未经验证。求值、`InputForm` 结果、`Image` 导出、截断与错误分类在两套已测安装上均通过，与本限制无关。
 
 ## 许可证
 

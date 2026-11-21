@@ -1,6 +1,6 @@
 {
   "name": "dsh-wolfram-renew",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Wolfram Engine / Mathematica for DeepSeek Harness: a sandboxed wolfram tool with a bilingual settings page",
   "type": "module",
   "main": "index.js",

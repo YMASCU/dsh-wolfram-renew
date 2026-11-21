@@ -51,9 +51,9 @@ export const Config = await (async () => {
 
 const DESCRIPTION = '最严谨精密的数学工具，调用 Mathematica（Wolfram 引擎）计算数学表达式，支持符号积分、解方程、极限、级数展开等。适合科学研究、工程计算、数学建模等场景。'
 
-const GUIDANCE = `\`wolfram\` evaluates Wolfram Language through the local Wolfram Engine install and returns the result as \`InputForm\` text. Use it for exact symbolic and numeric work — integrals, series, limits, equation systems, special functions, high-precision values — and prefer it over hand derivation for non-trivial algebra.
+const GUIDANCE = `\`wolfram\` evaluates Wolfram Language through the local Wolfram Engine install and returns the result as text; ordinary results come back in \`InputForm\`. Use it for exact symbolic and numeric work — integrals, series, limits, equation systems, special functions, high-precision values — and prefer it over hand derivation for non-trivial algebra.
 
-A Mathematica error (a message plus \`$Failed\`) fails the call instead of being returned as a result. Long runs can raise \`timeout\` (seconds); a kernel that outlives it keeps running as a background job whose id the result names, for \`job_output\` or \`job_kill\`.
+A \`;\`-separated compound yields only the value of its last expression, and a trailing \`;\` yields \`Null\`; put every value you need into one List.
 `
 /** Positive millisecond budget from either config spelling, or the default. */
 function resolveBudget(value, fallback) {

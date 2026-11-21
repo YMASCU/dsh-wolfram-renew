@@ -1,7 +1,7 @@
 /**
  * dsh-wolfram — executable discovery, confined evaluation, and background hand-off.
  *
- * Three behaviours are deliberate here:
+ * Four behaviours are deliberate here:
  *
  *   1. Resolution never assumes `wolframscript` is on `PATH`: a Wolfram Engine
  *      installed on a data drive is common, and a half-removed standalone
@@ -14,9 +14,25 @@
  *      with exit code 0) fails the tool call instead of being returned as an
  *      answer, and an evaluation that outlives its deadline is handed over to
  *      the job registry as a background job instead of being killed.
+ *   4. Both streams are collected the way the harness shells collect theirs
+ *      (see `dsh-subprocess-local/src/output.ts`): a bounded in-memory tail, a
+ *      spill file holding the complete stream, and a truncation notice naming
+ *      it. Image/graphics results never degrade to `InputForm`: the kernel
+ *      writes them into the platform temporary directory and reports the path.
  */
 import { spawn } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+import {
+  closeSync,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  rmdirSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs'
+import { randomBytes } from 'node:crypto'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 
 const IS_WINDOWS = process.platform === 'win32'
@@ -36,8 +52,19 @@ export const DEFAULT_TIMEOUT_MS = 120_000
 /** Ceiling for a per-call `timeout`, so one call cannot pin a kernel forever. */
 export const MAX_TIMEOUT_MS = 600_000
 
-/** In-memory tail per stream the child backend keeps. */
-const STREAM_MAX_BYTES = 8 * 1024 * 1024
+/**
+ * Per-stream in-memory tail, the harness shells' `maxOutputBytes` (64,000
+ * bytes). Only the tail is model-facing; the complete stream goes to a spill
+ * file, so a truncated result never reads as a complete one.
+ */
+export const DEFAULT_OUTPUT_MAX_BYTES = 64_000
+
+/**
+ * Cap for one stream's complete-output spill file, the harness shells'
+ * `maxSpillBytes`. Above it the collector stops advertising a file instead of
+ * promising a truncated one.
+ */
+export const DEFAULT_SPILL_MAX_BYTES = 64 * 1024 * 1024
 
 /** The job kind, and therefore the id prefix (`wolfram-<id>`). */
 const JOB_KIND = 'wolfram'
@@ -47,6 +74,32 @@ const JOB_LABEL_MAX = 80
 
 /** One `job_output` read stays within a shell-sized tail. */
 const JOB_OUTPUT_LIMIT_BYTES = 64_000
+
+/**
+ * Result heads the kernel writes as an image file instead of printing. Every
+ * one of them is a graphical object whose `InputForm` is unusable to a model:
+ * `Animate` evaluates to a `Manipulate` (measured on Wolfram Engine 15.0), so
+ * the animated case is covered by both spellings; the container heads
+ * (`GraphicsRow` and friends) hold graphics and are exported the same way.
+ */
+export const GRAPHICS_HEADS = [
+  'Image',
+  'Image3D',
+  'Graphics',
+  'Graphics3D',
+  'GraphicsComplex',
+  'Legended',
+  'Manipulate',
+  'Animate',
+  'ListAnimate',
+  'GraphicsRow',
+  'GraphicsGrid',
+  'GraphicsColumn',
+  'GeoGraphics',
+]
+
+/** Heads that export as an animation rather than a still image. */
+export const ANIMATED_HEADS = ['Manipulate', 'Animate', 'ListAnimate']
 
 /** A failed evaluation, phrased for the model. */
 export class WolframError extends Error {
@@ -181,17 +234,73 @@ function wlString(text) {
 }
 
 /**
- * The `math -run` program that reproduces `wolframscript -code <source>`: parse
- * and evaluate the source, then write the result in `InputForm`.
+ * The `math -run` program behind one evaluation.
+ *
+ * It reproduces `wolframscript -code <source>` for ordinary results (parse,
+ * evaluate, write the value in `InputForm`), and it replaces that text for a
+ * graphical result: the kernel exports the object into the platform temporary
+ * directory — `$TemporaryDirectory`, which the runner points at the session's
+ * private temporary directory under confinement — and prints the path with a
+ * one-line description instead of an `InputForm` dump.
  *
  * `WriteString` rather than `Print`: this console front-end renders a `Print`ed
- * string with quotes (`Print[ToString[...]]` emits `"Sin[x]"`), which would turn
- * every result into a quoted literal. No spaces either, so the whole program
- * stays one argv token through the sandbox runner.
+ * string with quotes, which would turn every result into a quoted literal.
+ *
+ * Two facts measured on Wolfram Engine 15.0 shape the export branch:
+ *   - `Export` of `Image` data works in a kernel-only session; a
+ *     `Graphics`-family export works too once Wolfram's graphics components are
+ *     installed, which the kernel does on first use by downloading a paclet —
+ *     a download a confined session cannot perform, so the first confined
+ *     export of a `Graphics` can legitimately write no file;
+ *   - an export can emit messages and still write the file, so success is
+ *     judged by `FileExistsQ` plus a non-zero byte count, never by `Export`'s
+ *     return value.
+ *
+ * No front end is borrowed: `UsingFrontEnd` was dropped because a measured
+ * Mathematica 13.2 install never reached it (`Export` does not return there),
+ * an Engine-only install has no front end to borrow, and on a full Mathematica
+ * install it would start a front end the console session does not otherwise own.
+ *
+ * Export output is redirected to a throw-away stream (`$Output`) so
+ * format-registration messages cannot be mistaken for a result. (Measured:
+ * progress lines a child process writes — a paclet installer's — bypass that
+ * redirection; on a first-ever component install they precede the marker block
+ * and are returned as-is, because no stream is ever stripped.)
  */
 function runProgram(source) {
-  return `$dshResult=ToExpression[${wlString(source)}];`
-    + 'WriteString[$Output,ToString[$dshResult,InputForm],"\\n"];Exit[]'
+  const heads = GRAPHICS_HEADS.map((head) => `"${head}"`).join(',')
+  const animated = ANIMATED_HEADS.map((head) => `"${head}"`).join(',')
+  const note = 'the export produced no file although the output directory was created (Wolfram '
+    + 'installs its graphics components on first use, and a session that cannot download them '
+    + 'cannot rasterize); the result was not printed as InputForm'
+  const noWriteNote = 'the output directory could not be created, so no image file was written '
+    + '(a read-only session allows no writes); the result was not printed as InputForm'
+  const program = `
+Module[{dshExpr,dshHeads,dshHead,dshExt,dshFmt,dshDir,dshFile,dshSink,dshQuiet,dshWritable,dshBytes,dshDims},
+ dshExpr=ToExpression[${wlString(source)}];
+ dshHeads={${heads}};
+ dshHead=ToString[Head[dshExpr]];
+ If[!MemberQ[dshHeads,dshHead],
+  WriteString[$Output,ToString[dshExpr,InputForm],"\\n"];Exit[]];
+ dshExt=If[MemberQ[{${animated}},dshHead],"gif","png"];
+ dshFmt=If[dshExt==="gif","GIF","PNG"];
+ dshDir=FileNameJoin[{$TemporaryDirectory,"dsh-wolfram","wl-"<>ToString[$ProcessID]<>"-"<>ToString[Round[AbsoluteTime[]*1000.]]}];
+ dshFile=FileNameJoin[{dshDir,"result."<>dshExt}];
+ dshSink=Quiet@Check[OpenWrite[],$Failed];
+ dshQuiet[code_]:=If[OutputStreamQ[dshSink],Block[{$Output=dshSink},Quiet[code]],Quiet[code]];
+ dshQuiet[Check[CreateDirectory[dshDir,CreateIntermediateDirectories->True],$Failed]];
+ dshWritable=DirectoryQ[dshDir];
+ dshQuiet[Check[Export[dshFile,dshExpr,dshFmt],$Failed]];
+ dshBytes=If[FileExistsQ[dshFile],FileByteCount[dshFile],0];
+ dshDims=If[dshExt==="png"&&ImageQ[dshExpr],ImageDimensions[dshExpr],$Failed];
+ If[OutputStreamQ[dshSink],Close[dshSink]];
+ If[dshBytes>0,
+  WriteString[$Output,"[graphics] head: ",dshHead,"\\n","[graphics] file: ",dshFile,"\\n","[graphics] format: ",dshFmt,Which[ListQ[dshDims]," ("<>ToString[dshDims[[1]]]<>"x"<>ToString[dshDims[[2]]]<>" px)",dshExt==="gif"," (animation)",True,""],", ",ToString[dshBytes]," bytes\\n"],
+  WriteString[$Output,"[graphics] head: ",dshHead,"\\n","[graphics] file: (none)","\\n","[graphics] note: ",If[dshWritable,"${note}","${noWriteNote}"],"\\n"]];
+ Exit[]]`
+  // One argv token: no spaces or newlines survive, so the program reaches the
+  // kernel unchanged through the sandbox runner. (`\n` escapes stay escapes.)
+  return program.replace(/\s+/g, ' ').trim()
 }
 
 /**
@@ -210,13 +319,14 @@ function invocationFor(dir, source, frontend) {
   const hasScript = existsSync(scriptPath)
   const hasMath = existsSync(mathPath)
   if (!hasScript && !hasMath) return undefined
+  const program = runProgram(source)
   if (frontend === 'wolframscript' && hasScript) {
-    return { image: scriptPath, argv: [scriptPath, '-code', source] }
+    return { image: scriptPath, argv: [scriptPath, '-code', program] }
   }
   if (hasMath) {
-    return { image: mathPath, argv: [mathPath, '-noprompt', '-run', runProgram(source)] }
+    return { image: mathPath, argv: [mathPath, '-noprompt', '-run', program] }
   }
-  return { image: scriptPath, argv: [scriptPath, '-code', source] }
+  return { image: scriptPath, argv: [scriptPath, '-code', program] }
 }
 
 /**
@@ -258,27 +368,170 @@ function normalize(text) {
   return String(text ?? '').replace(/\r\n/g, '\n').trim()
 }
 
+// --- Bounded collection with a spill file ----------------------------------
+
+let spillCounter = 0
+let spillDirectory
+
 /**
- * Mathematica does not report errors through the exit code: a syntax error is
- * an exit-0 run whose output carries a message and `$Failed`. Treat that as a
- * failure, but keep ordinary results that merely come with warnings.
+ * The one spill location: a private (0700) per-process directory under the OS
+ * temporary area, created lazily. Predictable world-readable paths would let
+ * other local users read evaluation output or pre-create symlinks. When the
+ * directory cannot be created the collectors degrade to their in-memory tail,
+ * which the truncation notice then reports as `(unavailable)`.
  */
-function classify(exitCode, stdout, stderr) {
-  const out = normalize(stdout)
-  const err = normalize(stderr)
-  if (/(^|\n)\$Failed\s*$/.test(out)) {
-    return { ok: false, text: [err, out].filter(Boolean).join('\n') }
+function privateSpillDirectory() {
+  if (spillDirectory === undefined) {
+    spillDirectory = mkdtempSync(path.join(tmpdir(), 'dsh-wolfram-'))
   }
-  if (exitCode !== 0) {
-    return {
-      ok: false,
-      text: [`wolframscript exited with code ${exitCode}`, err, out].filter(Boolean).join('\n'),
+  return spillDirectory
+}
+
+// A directory that never spilled is empty and safe to remove; one holding
+// completed spill files keeps them — their content is the recovery artifact.
+process.once('exit', () => {
+  if (spillDirectory === undefined) return
+  try {
+    rmdirSync(spillDirectory)
+  } catch {
+    // ENOENT / ENOTEMPTY / EBUSY: OS temp hygiene owns the residue.
+  }
+})
+
+/**
+ * One stream with a bounded in-memory tail, mirroring the harness shells'
+ * `OutputCollector` (`dsh-subprocess-local/src/output.ts`): on first overflow a
+ * spill file is opened and receives every chunk (the already collected ones
+ * included) while the stream fits the spill cap; the in-memory window then
+ * keeps only the last `maxBytes`, because errors and final results cluster at
+ * the end of output.
+ */
+class StreamCollector {
+  constructor(label, maxBytes = DEFAULT_OUTPUT_MAX_BYTES) {
+    this.label = label
+    this.maxBytes = maxBytes
+    this.chunks = []
+    this.bytes = 0
+    this.total = 0
+    this.dropped = false
+    this.fd = undefined
+    this.file = undefined
+    this.spillDisabled = false
+  }
+
+  /** Ingest one stream chunk, counting it toward the whole-stream total. */
+  push(chunk) {
+    this.total += chunk.length
+    const overflows = this.bytes + chunk.length > this.maxBytes
+    if (!this.spillDisabled && (overflows || this.fd !== undefined)) this.spill(chunk)
+    this.chunks.push(chunk)
+    this.bytes += chunk.length
+    while (this.bytes > this.maxBytes) {
+      const head = this.chunks[0]
+      const excess = this.bytes - this.maxBytes
+      if (head.length <= excess) {
+        this.chunks.shift()
+        this.bytes -= head.length
+      } else {
+        // Byte-exact tail: the retained window holds the LAST maxBytes
+        // regardless of how the stream was chunked.
+        this.chunks[0] = head.subarray(excess)
+        this.bytes -= excess
+      }
+      this.dropped = true
     }
   }
-  if (!out) {
-    return { ok: false, text: err || 'wolframscript produced no output (exit 0)' }
+
+  /**
+   * Open the spill file lazily and append the chunk (and any prior chunks
+   * once). Runs inside the stream's `'data'` listener, so every filesystem
+   * failure is contained: the spill is discarded and collection continues with
+   * the in-memory tail alone.
+   */
+  spill(chunk) {
+    if (this.total > DEFAULT_SPILL_MAX_BYTES) {
+      this.discardSpill()
+      return
+    }
+    try {
+      if (this.fd === undefined) {
+        // Random suffix + O_EXCL ('wx' fails on any existing path, symlink or
+        // not) + owner-only mode: defeats spill-path prediction in a shared
+        // temp area. The path is published only after the open succeeded.
+        const file = path.join(
+          privateSpillDirectory(),
+          `wolfram-${process.pid}-${++spillCounter}-${randomBytes(6).toString('hex')}-${this.label}.log`,
+        )
+        const fd = openSync(file, 'wx', 0o600)
+        this.file = file
+        this.fd = fd
+        for (const prior of this.chunks) writeSync(fd, prior)
+      }
+      writeSync(this.fd, chunk)
+    } catch {
+      this.discardSpill()
+    }
   }
-  return { ok: true, text: err ? `${out}\n\n[stderr]\n${err}` : out }
+
+  /** Stop spilling and remove the file once it can no longer hold the stream. */
+  discardSpill() {
+    this.spillDisabled = true
+    const fd = this.fd
+    const file = this.file
+    this.fd = undefined
+    this.file = undefined
+    if (fd !== undefined) {
+      try {
+        closeSync(fd)
+      } catch {
+        // Nothing left to recover from a failed close.
+      }
+    }
+    if (file !== undefined) {
+      try {
+        unlinkSync(file)
+      } catch {
+        // At most DEFAULT_SPILL_MAX_BYTES left behind.
+      }
+    }
+  }
+
+  /**
+   * Incremental read in whole-stream byte coordinates: everything pushed since
+   * `fromByte`. A cursor that already slid out of the tail window is `lossy` —
+   * the read returns the whole retained tail and the gap is only recoverable
+   * from the spill file.
+   */
+  readFrom(fromByte) {
+    const windowStart = this.total - this.bytes
+    const requested = Number(fromByte)
+    const from = Number.isFinite(requested) && requested > 0
+      ? Math.min(requested, this.total)
+      : 0
+    const lossy = from < windowStart
+    const buffer = Buffer.concat(this.chunks)
+    const slice = lossy ? buffer : buffer.subarray(from - windowStart)
+    return {
+      text: slice.toString('utf8'),
+      nextOffset: this.total,
+      lossy,
+      ...this.file === undefined ? {} : { spillPath: this.file },
+    }
+  }
+
+  /** Seal the spill file once the stream ended; later reads still work. */
+  seal() {
+    if (this.fd === undefined) return
+    try {
+      closeSync(this.fd)
+      this.fd = undefined
+    } catch {
+      // A delayed writeback failure makes the spill unreliable: stop
+      // advertising it rather than pointing the model at a file missing its tail.
+      this.fd = undefined
+      this.file = undefined
+    }
+  }
 }
 
 /** A one-line job label: what `job_list` and every status line show. */
@@ -296,13 +549,6 @@ export function usableJobs(jobs) {
   return jobs !== undefined && jobs !== null && typeof jobs.start === 'function'
 }
 
-/** Append to an in-memory stream, keeping only its bounded tail. */
-function appendChunk(stream, chunk) {
-  const next = stream.text + chunk
-  stream.text = next.length > STREAM_MAX_BYTES ? next.slice(-STREAM_MAX_BYTES) : next
-  stream.lossy = next.length > STREAM_MAX_BYTES
-}
-
 /**
  * The one backend: `child_process` with `windowsHide`, so the console-subsystem
  * front-end never flashes a window when it is launched from the GUI host. The
@@ -316,11 +562,12 @@ function childBackend() {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       })
-      const streams = { stdout: { text: '', lossy: false }, stderr: { text: '', lossy: false } }
-      child.stdout.setEncoding('utf8')
-      child.stderr.setEncoding('utf8')
-      child.stdout.on('data', (chunk) => appendChunk(streams.stdout, chunk))
-      child.stderr.on('data', (chunk) => appendChunk(streams.stderr, chunk))
+      const collectors = {
+        stdout: new StreamCollector('stdout'),
+        stderr: new StreamCollector('stderr'),
+      }
+      child.stdout.on('data', (chunk) => collectors.stdout.push(chunk))
+      child.stderr.on('data', (chunk) => collectors.stderr.push(chunk))
 
       const started = new Promise((resolve) => {
         child.once('spawn', () => resolve({ ok: true }))
@@ -341,11 +588,14 @@ function childBackend() {
         started,
         done,
         terminate,
+        seal() {
+          collectors.stdout.seal()
+          collectors.stderr.seal()
+        },
         read(channel, from) {
-          const stream = streams[channel] ?? { text: '', lossy: false }
-          const offset = Number(from)
-          const start = Number.isFinite(offset) ? Math.max(0, Math.min(offset, stream.text.length)) : 0
-          return { text: stream.text.slice(start), nextOffset: stream.text.length, lossy: stream.lossy }
+          const collector = collectors[channel]
+          if (collector === undefined) return { text: '', nextOffset: 0, lossy: false }
+          return collector.readFrom(from)
         },
       }
     },
@@ -372,6 +622,71 @@ function raceRun(done, timeoutMs, signal) {
     signal?.addEventListener?.('abort', onAbort, { once: true })
     done.then(() => settle('exit'), () => settle('exit'))
   })
+}
+
+/**
+ * One stream as the model reads it plus the facts the notice needs. `lossy`
+ * is the collector's verdict that the head slid out of the retained tail;
+ * `spillPath` names the file holding the complete stream when one was kept.
+ */
+function finalStreams(handle) {
+  handle.seal()
+  const read = (channel) => {
+    const piece = handle.read(channel, 0)
+    return {
+      text: normalize(piece.text),
+      truncated: piece.lossy === true,
+      ...piece.spillPath === undefined ? {} : { spillPath: piece.spillPath },
+    }
+  }
+  return { stdout: read('stdout'), stderr: read('stderr') }
+}
+
+/**
+ * One stream rendered with its truncation notice, exactly as the shell tools
+ * render theirs: a tail alone would read as the whole output, so the notice
+ * names the spill file, and `(unavailable)` says so honestly when the spill
+ * itself exceeded its cap.
+ */
+function streamText(stream) {
+  if (!stream.truncated) return stream.text
+  return `${stream.text}\n[output truncated; full output: ${stream.spillPath ?? '(unavailable)'}]`
+}
+
+/**
+ * Mathematica does not report errors through the exit code: a syntax error is
+ * an exit-0 run whose output carries a message and `$Failed`. Treat that as a
+ * failure, but keep ordinary results that merely come with warnings.
+ *
+ * Nothing is stripped from any stream: a result is exactly what the kernel
+ * wrote, so a Mathematica message or the progress lines of a first-time
+ * component installer stay visible ahead of the answer.
+ *
+ * `streams` are already bounded tails; the truncation notice travels with the
+ * text on both the success and the failure path, so a cut-off diagnostic says
+ * where the rest is.
+ */
+function classify(exitCode, streams) {
+  // The `$Failed` verdict reads the raw tail: the truncation notice may follow
+  // it, so testing the rendered text would miss a cut-off failure.
+  if (/(^|\n)\$Failed\s*$/.test(streams.stdout.text)) {
+    return {
+      ok: false,
+      text: [streamText(streams.stderr), streamText(streams.stdout)].filter(Boolean).join('\n'),
+    }
+  }
+  const out = streamText(streams.stdout)
+  const err = streamText(streams.stderr)
+  if (exitCode !== 0) {
+    return {
+      ok: false,
+      text: [`wolframscript exited with code ${exitCode}`, err, out].filter(Boolean).join('\n'),
+    }
+  }
+  if (!out) {
+    return { ok: false, text: err || 'wolframscript produced no output (exit 0)' }
+  }
+  return { ok: true, text: err ? `${out}\n\n[stderr]\n${err}` : out }
 }
 
 /**
@@ -402,7 +717,7 @@ function registerJob(jobs, { handle, expression, exec }) {
       ],
       run: () => ({
         done: handle.done.then(({ code }) => {
-          const verdict = classify(code, handle.read('stdout', 0).text, handle.read('stderr', 0).text)
+          const verdict = classify(code, finalStreams(handle))
           return { status: verdict.ok ? 'completed' : 'failed', detail: `exit code: ${code}` }
         }),
         cancel: () => handle.terminate(),
@@ -417,7 +732,12 @@ function registerJob(jobs, { handle, expression, exec }) {
 
 /** The text handed back when a run is promoted to a background job. */
 function promotedText(jobId, timeoutMs, handle) {
-  const partial = normalize(handle.read('stdout', 0).text)
+  const read = handle.read('stdout', 0)
+  const partial = streamText({
+    text: normalize(read.text),
+    truncated: read.lossy === true,
+    ...read.spillPath === undefined ? {} : { spillPath: read.spillPath },
+  })
   const sections = [
     `Still running after ${timeoutMs / 1000}s, so the kernel was handed over to background job \`${jobId}\` `
       + 'instead of being killed.',
@@ -436,6 +756,12 @@ function promotedText(jobId, timeoutMs, handle) {
  * as a background job. Every failure — syntax error, non-zero exit, missing
  * executable, refused confinement, aborted call — rejects with a
  * {@link WolframError}.
+ *
+ * Output is bounded: each stream keeps a 64,000-byte tail and the complete
+ * stream goes to a spill file named by the `[output truncated; ...]` notice,
+ * matching the harness shells. A graphical result is written to an image file
+ * in the platform temporary directory and reported as a path, never as
+ * `InputForm`.
  *
  * @param {string} expression - Wolfram Language source.
  * @param {{ directory?: string, timeoutMs?: number, frontend?: 'math'|'wolframscript',
@@ -513,8 +839,8 @@ export async function runWolfram(expression, options = {}) {
 
   if (settled === 'exit') {
     const { code } = await handle.done
-    const stdoutText = handle.read('stdout', 0).text
-    const stderrText = handle.read('stderr', 0).text
+    const streams = finalStreams(handle)
+    const stderrText = streams.stderr.text
     const runnerFailure = classifyRunnerFailure(code, stderrText, runnerRules)
     if (runnerFailure !== undefined) {
       throw new WolframError(
@@ -524,9 +850,9 @@ export async function runWolfram(expression, options = {}) {
         'sandbox-runner',
       )
     }
-    const verdict = classify(code, stdoutText, stderrText)
+    const verdict = classify(code, streams)
     if (!verdict.ok) {
-      const denied = matchesDenial(code, `${stdoutText}\n${stderrText}`, denialSignatures)
+      const denied = matchesDenial(code, `${streams.stdout.text}\n${stderrText}`, denialSignatures)
       const text = denied
         ? `${verdict.text}\n\n[sandbox: file access denied under ${mode ?? 'confined'} mode]`
         : verdict.text
